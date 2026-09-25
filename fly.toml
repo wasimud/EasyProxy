@@ -1,34 +1,20 @@
-app = "easy-proxy" # Sostituisci con il nome univoco della tua app su Fly.io
-primary_region = "cdg" # Codice regione (es. cdg = Parigi, fra = Francoforte)
+app = "easyproxy-yaabbg"
+primary_region = "iad"
 
 [build]
 
 [env]
   PORT = "7860"
 
-[[services]]
-  protocol = "tcp"
-  internal_port = 7860
-  processes = ["app"]
-
-  [[services.ports]]
-    port = 80
-    handlers = ["http"]
-    force_https = true
-
-  [[services.ports]]
-    port = 443
-    handlers = ["http", "tls"]
-
-  [services.concurrency]
-    type = "connections"
-    hard_limit = 25
-    soft_limit = 20
-
-[[http_service]]
+[http_service]
   internal_port = 7860
   force_https = true
   auto_stop_machines = false
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ["app"]
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
