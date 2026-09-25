@@ -4,7 +4,7 @@ primary_region = "cdg" # Codice regione (es. cdg = Parigi, fra = Francoforte)
 [build]
 
 [env]
-  PORT = "8080"
+  PORT = "7860"
 
 [[services]]
   protocol = "tcp"
