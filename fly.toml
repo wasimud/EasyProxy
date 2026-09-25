@@ -26,7 +26,7 @@ primary_region = "cdg" # Codice regione (es. cdg = Parigi, fra = Francoforte)
     soft_limit = 20
 
 [[http_service]]
-  internal_port = 8080
+  internal_port = 7860
   force_https = true
   auto_stop_machines = false
   auto_start_machines = true
