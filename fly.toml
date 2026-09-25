@@ -8,7 +8,7 @@ primary_region = "cdg" # Codice regione (es. cdg = Parigi, fra = Francoforte)
 
 [[services]]
   protocol = "tcp"
-  internal_port = 8080
+  internal_port = 7860
   processes = ["app"]
 
   [[services.ports]]
