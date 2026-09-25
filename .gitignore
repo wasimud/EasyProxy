@@ -12,7 +12,9 @@ dlstreams_activity.txt
 !/scripts/embedst_runner.mjs
 !/scripts/vidfast_runner.mjs
 !/scripts/warp_userspace_ctl.sh
+!/scripts/wg_tunnel_ctl.sh
 !/scripts/cinejoy_runner.mjs
+!/scripts/pow_solver.js
 config.json
 /downloaded_files
 /cache
@@ -22,3 +24,4 @@ config.json
 /data-test-warp/
 /.pytest_cache/
 /tests
+/output

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Headless Cinejoy stream resolver.
-// Uses Node's native WebAssembly and webcrypto to call Cinejoy's gateway (api.shegu.st).
+// Uses Node's native WebAssembly and webcrypto to call Cinejoy's gateway (api.wing.st).
 
 import { webcrypto } from "node:crypto";
 
@@ -15,9 +15,16 @@ if (!input) {
   process.exit(2);
 }
 
-const API_URL = "https://api.shegu.st";
+const API_URL = "https://api.wing.st";
 const WASM_URL = `${API_URL}/crush.wasm`;
-const BASE_URL = "https://cinejoy.to";
+const BASE_URL = (() => {
+  try {
+    const u = new URL(input.startsWith("http") ? input : `https://${input}`);
+    return /(^|\.)cinejoy\.[a-z]{2,}$/i.test(u.hostname) ? u.origin : "https://cinejoy.to";
+  } catch {
+    return "https://cinejoy.to";
+  }
+})();
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 let proxyDispatcher = null;
@@ -205,11 +212,15 @@ async function getServers() {
 
 async function resolve() {
   const target = parseTarget(input);
+  const require4k = process.env.CINEJOY_REQUIRE_4K === "1";
   log("Target:", target);
 
   const servers = await getServers();
-  const primaryServer = servers.find((s) => s["4k"] === true) || servers[0];
-  if (!primaryServer) throw new Error("No active Cinejoy server found");
+  const primaryServer = servers.find((s) => s["4k"] === true)
+    || (require4k ? null : servers[0]);
+  if (!primaryServer) {
+    throw new Error(require4k ? "No active Cinejoy 4K server found" : "No active Cinejoy server found");
+  }
   log("Using server:", primaryServer.name);
 
   const isMovie = target.type === "movie";

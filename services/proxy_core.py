@@ -4,6 +4,7 @@ import hmac
 import logging
 import os
 import re
+import secrets
 import time
 import urllib.parse
 import aiohttp
@@ -32,6 +33,16 @@ from services.proxy_shared import (
     prefer_default_family_for_url,
     resolve_extractor,
 )
+
+# Docker keeps the helper at /app/scripts, Termux/native checkouts run it from
+# the repository: resolve it relative to the package and always run it through
+# /bin/sh (git checkouts do not carry the executable bit).
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WARP_CTL_SCRIPT = os.environ.get("WARP_CTL_SCRIPT") or os.path.join(
+    _PROJECT_DIR, "scripts", "warp_userspace_ctl.sh"
+)
+
+
 class SharedSessionWrapper:
     def __init__(self, session):
         object.__setattr__(self, "_session", session)
@@ -57,6 +68,10 @@ class SharedSessionWrapper:
 
 
 class HLSProxyCoreMixin:
+
+    # Extractor polls for the same source+client reuse one playback namespace
+    # for this long (matches the 60s per-stream session idle TTL).
+    STREAM_KEY_REUSE_SECONDS = 60.0
 
     @staticmethod
     def _pow_search(hmac_hash: str, resource: str, number: str, ts: int, max_iter: int) -> int:
@@ -275,11 +290,12 @@ class HLSProxyCoreMixin:
 
     async def _wireproxy_process_state(self) -> tuple[str, str]:
         """Return wireproxy process state without confusing it with tunnel state."""
-        control_script = "/app/scripts/warp_userspace_ctl.sh"
+        control_script = WARP_CTL_SCRIPT
         if not os.path.exists(control_script):
             return "unknown", "control script unavailable"
         try:
             proc = await asyncio.create_subprocess_exec(
+                "/bin/sh",
                 control_script,
                 "status",
                 stdout=asyncio.subprocess.PIPE,
@@ -456,13 +472,21 @@ class HLSProxyCoreMixin:
 
     async def _run_warp_control(self, action: str) -> int:
         """Run the explicit userspace WARP control action."""
-        proc = await asyncio.create_subprocess_exec(
-            "/app/scripts/warp_userspace_ctl.sh",
-            action,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        return await asyncio.wait_for(proc.wait(), timeout=20)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/sh",
+                WARP_CTL_SCRIPT,
+                action,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return await asyncio.wait_for(proc.wait(), timeout=20)
+        except asyncio.TimeoutError:
+            logger.warning("WARP control %s timed out", action)
+            return 124
+        except OSError as exc:
+            logger.warning("WARP control %s failed: %s", action, exc)
+            return 127
 
     async def reconnect_warp(self) -> dict:
         """Restart wireproxy and verify the WARP path after reconnect."""
@@ -515,39 +539,47 @@ class HLSProxyCoreMixin:
         Can be called on-demand (e.g. on page refresh).
         Uses its own temporary session to avoid resetting the shared session idle timer.
         """
-        now = time.monotonic()
-        if now - getattr(self, "_latest_version_checked_at", 0.0) < 3600.0:
-            return
-        # Set before I/O so simultaneous page/API requests cannot create
-        # duplicate GitHub sessions. Background task retries on next interval.
-        self._latest_version_checked_at = now
+        lock = getattr(self, "_latest_version_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._latest_version_lock = lock
 
-        try:
-            cache_buster = int(time.time())
-            url = f"https://raw.githubusercontent.com/realbestia1/EasyProxy/main/config.py?t={cache_buster}"
+        # Serialize foreground page loads and the background check. The old
+        # implementation marked the check as complete before doing I/O, so a
+        # page could render "Checking..." while another task was still fetching.
+        async with lock:
+            now = time.monotonic()
+            checked_at = getattr(self, "_latest_version_checked_at", 0.0)
+            if checked_at > 0.0 and now - checked_at < 3600.0:
+                if self.latest_version == "Checking...":
+                    self.latest_version = "Unknown"
+                return
 
-            connector = TCPConnector(limit=1, limit_per_host=1, keepalive_timeout=5)
-            timeout = ClientTimeout(total=5)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get(url, timeout=2) as resp:
-                    if resp.status == 200:
-                        text = await resp.text()
-                        match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
-                        if match:
-                            new_version = match.group(1)
-                            if self.latest_version != new_version:
-                                self.latest_version = new_version
-                                logger.info(f"🆕 Latest version updated: {self.latest_version}")
-                        else:
-                            if self.latest_version == "Checking...":
+            try:
+                cache_buster = int(time.time())
+                url = f"https://raw.githubusercontent.com/realbestia1/EasyProxy/main/config.py?t={cache_buster}"
+
+                connector = TCPConnector(limit=1, limit_per_host=1, keepalive_timeout=5)
+                timeout = ClientTimeout(total=5)
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.get(url, timeout=2) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            match = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+                            if match:
+                                new_version = match.group(1)
+                                if self.latest_version != new_version:
+                                    self.latest_version = new_version
+                                    logger.info(f"🆕 Latest version updated: {self.latest_version}")
+                            else:
                                 self.latest_version = "Unknown"
-                    else:
-                        if self.latest_version == "Checking...":
+                        else:
                             self.latest_version = "Error"
-        except Exception as e:
-            if self.latest_version == "Checking...":
+            except Exception as e:
                 self.latest_version = "Unknown"
-            logger.debug(f"Version check skipped or failed: {e}")
+                logger.debug(f"Version check skipped or failed: {e}")
+            finally:
+                self._latest_version_checked_at = time.monotonic()
 
     @staticmethod
     def _strip_fake_png_header_from_ts(content: bytes) -> bytes:
@@ -1107,6 +1139,50 @@ class HLSProxyCoreMixin:
         if not url:
             return None
         return hashlib.md5(url.encode()).hexdigest()[:12]
+
+    def _request_forces_max_res(self, request, extractor_key: str | None, source: str) -> bool:
+        """Apply the max-res policy for this request.
+
+        Direct /proxy/mpd and /proxy/hls calls honour the admin MPD/HLS
+        switches; requests that belong to an extractor (query namespace or the
+        extractor endpoint itself) honour only the per-extractor list.
+        """
+        query_key = request.query.get("extractor_key", "")
+        proxy_endpoint = request.path.startswith("/proxy/")
+        key = query_key or ("" if proxy_endpoint else (extractor_key or ""))
+        requested = request.query.get("max_res", "").lower() in {"1", "true", "yes", "on"}
+        return _config.should_force_max_res(
+            key,
+            requested,
+            source,
+            proxy_endpoint=proxy_endpoint,
+        )
+
+    def _reuse_stream_key(self, source_key: str, client_id: str = "") -> str:
+        """Keep one playback namespace while the player polls the extractor.
+
+        Players reload the extractor URL every few seconds; minting a new
+        stream_key per call created (and closed) one upstream session per poll.
+        Reuse the key per source+client IP for a quiet period (60s, the same
+        idle TTL the session reaper uses), so viewers behind different IPs keep
+        separate sessions while devices that share an IP also share the session.
+        """
+        now = time.time()
+        cache = getattr(self, "_stream_key_cache", None)
+        if cache is None:
+            cache = {}
+            self._stream_key_cache = cache
+        cache_key = f"{client_id}|{source_key}"
+        entry = cache.get(cache_key)
+        if entry and now - entry[0] < self.STREAM_KEY_REUSE_SECONDS:
+            cache[cache_key] = (now, entry[1])
+            return entry[1]
+        stream_key = f"{source_key}-{secrets.token_hex(6)}"
+        cache[cache_key] = (now, stream_key)
+        while len(cache) > 512:
+            oldest = min(cache, key=lambda key: cache[key][0])
+            cache.pop(oldest, None)
+        return stream_key
 
     def _touch_extractor_activity(self, extractor_key: str | None = None, stream_key: str | None = None):
         now = time.time()

@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     jq \
     wireguard-tools \
+    tor \
     tar \
     nodejs \
     node-undici \
@@ -89,6 +90,9 @@ ENV FLARESOLVERR_LOG_LEVEL=error
 # Copia esplicita
 COPY . .
 
+# Windows checkouts may carry CRLF into shell scripts; Linux must execute LF.
+RUN sed -i 's/\r$//' entrypoint.sh scripts/warp_userspace_ctl.sh scripts/wg_tunnel_ctl.sh
+
 # Node's ESM resolver does not search Debian's global module directory for a
 # bare import. Expose the apt-installed undici package from the app module
 # tree so the VidFast runner can use HTTP ProxyAgent when WARP is selected.
@@ -100,7 +104,7 @@ RUN mkdir -p /app/node_modules \
 # chromedriver comes from the same package set as Chromium above.
 RUN ln -sf "$(command -v chromedriver)" /app/chromedriver
 
-RUN chmod +x entrypoint.sh scripts/warp_userspace_ctl.sh
+RUN chmod +x entrypoint.sh scripts/warp_userspace_ctl.sh scripts/wg_tunnel_ctl.sh
 
 # 5. Metadata & Ports
 LABEL org.opencontainers.image.title="EasyProxy Monolith"

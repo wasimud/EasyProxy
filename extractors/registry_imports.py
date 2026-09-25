@@ -1,4 +1,5 @@
 import logging
+import re
 
 logger = logging.getLogger("extractors.registry")
 
@@ -38,6 +39,7 @@ logger = logging.getLogger("extractors.registry")
     F16PxExtractor,
     Sports99Extractor,
 ) = None, None, None, None, None, None
+GuardabestExtractor = None
 DLStreamsExtractor = None
 StreamHGExtractor = None
 VidXgoExtractor = None
@@ -207,6 +209,12 @@ except ImportError:
     logger.warning("⚠️ F16PxExtractor module not found.")
 
 try:
+    from extractors.guardabest import GuardabestExtractor
+    logger.info("✅ GuardabestExtractor module loaded.")
+except ImportError:
+    logger.warning("⚠️ GuardabestExtractor module not found.")
+
+try:
     from extractors.sports99 import Sports99Extractor
     logger.info("✅ Sports99Extractor module loaded.")
 except ImportError:
@@ -263,11 +271,23 @@ except Exception as e:
     RaiPlayExtractor = None
 
 try:
-    from extractors.ads import ADSExtractor
+    from extractors.ads import (
+        ADSExtractor,
+        ADS_HOST_PATTERN,
+        ADS_FILM_PATTERN,
+        ADS_SERIES_PATTERN,
+        ads_configured_host,
+    )
     logger.info("✅ ADSExtractor module loaded.")
 except Exception as e:
     logger.warning("⚠️ ADSExtractor failed to load: %s", e)
     ADSExtractor = None
+    ADS_HOST_PATTERN = re.compile(r"(?!)")
+    ADS_FILM_PATTERN = re.compile(r"(?!)")
+    ADS_SERIES_PATTERN = re.compile(r"(?!)")
+
+    def ads_configured_host() -> str:
+        return ""
 
 try:
     from extractors.cinejoy import CinejoyExtractor
@@ -301,6 +321,7 @@ __all__ = [
     "TurboVidPlayExtractor",
     "LiveTVExtractor",
     "F16PxExtractor",
+    "GuardabestExtractor",
     "Sports99Extractor",
     "DLStreamsExtractor",
     "StreamHGExtractor",
@@ -313,5 +334,9 @@ __all__ = [
     "WittyTVExtractor",
     "RaiPlayExtractor",
     "ADSExtractor",
+    "ADS_HOST_PATTERN",
+    "ADS_FILM_PATTERN",
+    "ADS_SERIES_PATTERN",
+    "ads_configured_host",
     "CinejoyExtractor",
 ]

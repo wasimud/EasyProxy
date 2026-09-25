@@ -392,10 +392,17 @@
         <p class="subtitle">Changes apply immediately &mdash; no restart required</p>
         <div class="version-chip">v{{APP_VERSION}}</div>
         <div style="margin-top: 1rem; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
-            <button class="btn btn-primary btn-sm" onclick="logout()">🚪 Logout</button>
-            <button class="btn btn-primary btn-sm" onclick="downloadConfig()">⬇ Download Config</button>
+            <button class="btn btn-primary btn-sm" onclick="logout()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:15px;height:15px"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+                Logout
+            </button>
+            <button class="btn btn-primary btn-sm" onclick="downloadConfig()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:15px;height:15px"><path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M4 20h16"/></svg>
+                Download Config
+            </button>
             <label class="btn btn-primary btn-sm" style="cursor:pointer">
-                ⬆ Upload Config
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="width:15px;height:15px"><path d="M12 20V8"/><path d="M7 12l5-5 5 5"/><path d="M4 4h16"/></svg>
+                Upload Config
                 <input type="file" id="upload-input" accept=".json" style="display:none" onchange="uploadConfig(event)">
             </label>
         </div>
@@ -507,6 +514,24 @@
             <h2><span class="icon">🚫</span> Proxy Off per Extractor</h2>
             <p class="help-text">Toggle custom proxies off for specific extractors (they will bypass all custom proxies and use WARP/Direct)</p>
             <div id="proxy-off-list" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+        </div>
+
+        <!-- Max Res (force highest quality) -->
+        <div class="card card-wide">
+            <h2><span class="icon">🎚️</span> Max Res (force highest quality)</h2>
+            <p class="help-text">Serve only the highest video variant (no adaptive bitrate). The two switches apply <strong>only to direct <code>/proxy/…</code> requests</strong> (the legacy <code>/proxy/manifest.m3u8</code> alias counts as HLS, <code>/proxy/stream</code> by source type); extractor streams are controlled by the per-extractor list below. A per-request <code>max_res=true</code> always works, everywhere.</p>
+            <div class="row">
+                <label>Direct DASH requests (<code>/proxy/mpd/manifest.m3u8</code> and <code>/proxy/mpd/manifest.mpd</code>)</label>
+                <div id="max-res-mpd-toggle" class="toggle" onclick="toggleMaxRes('mpd')"></div>
+                <span id="max-res-mpd-label" class="badge badge-off">OFF</span>
+            </div>
+            <div class="row">
+                <label>Direct HLS requests (<code>/proxy/hls/manifest.m3u8</code> and <code>/proxy/manifest.m3u8</code>)</label>
+                <div id="max-res-hls-toggle" class="toggle" onclick="toggleMaxRes('hls')"></div>
+                <span id="max-res-hls-label" class="badge badge-off">OFF</span>
+            </div>
+            <p class="help-text" style="margin-top:12px">Extractor streams (<code>/extractor</code> and its relayed URLs) — click to toggle:</p>
+            <div id="max-res-list" style="display:flex;flex-wrap:wrap;gap:6px"></div>
         </div>
 
         <!-- WARP Exclude Domains -->
@@ -660,6 +685,7 @@ async function runAllSpeedtests() {
             return '<div class="speedtest-card">' +
                 '<div style="font-weight:600;font-size:0.8rem;margin-bottom:4px">' + r.name + '</div>' +
                 (r.proxy_used ? '<div style="font-size:0.65rem;color:var(--accent-orange);margin-bottom:2px">📡 ' + r.proxy_used + '</div>' : '') +
+                (r.external_ip ? '<div style="font-size:0.65rem;color:var(--text-muted);margin-bottom:2px">IP uscente: ' + r.external_ip + '</div>' : '') +
                 '<div style="font-size:0.65rem;color:var(--text-muted);margin-bottom:4px">' + (r.server.sponsor && r.server.sponsor !== 'Unknown' ? r.server.sponsor + ' · ' : '') + r.server.location + '</div>' +
                 '<div style="display:flex;justify-content:space-between;padding:2px 0;font-size:0.75rem"><span style="color:var(--text-muted)">Ping</span><span style="color:var(--accent-primary)">' + r.ping_ms + ' ms</span></div>' +
                 '<div style="display:flex;justify-content:space-between;padding:2px 0;font-size:0.75rem"><span style="color:var(--text-muted)">⬇ Download</span><span style="color:var(--accent-success);font-weight:700">' + r.download_mbps + ' Mbps</span></div>' +
@@ -741,6 +767,9 @@ async function loadConfig() {
         populateExtractorSelect(config.available_extractors || []);
         renderWarpOffToggles(config.available_extractors || [], config.warp_off_extractors || []);
         renderProxyOffToggles(config.available_extractors || [], config.proxy_off_extractors || []);
+        renderMaxResToggles(config.available_extractors || [], config.max_res_extractors || []);
+        setToggle('max-res-mpd-toggle', config.max_res_mpd || false);
+        setToggle('max-res-hls-toggle', config.max_res_hls || false);
         renderExcludeDomains();
         renderProxyExcludeDomains();
 
@@ -786,7 +815,8 @@ async function loadConfig() {
 function renderExtractorProxies() {
     const container = document.getElementById('extractor-proxies-list');
     container.innerHTML = '';
-    for (const [name, entry] of Object.entries(extractorProxies)) {
+    for (const name of Object.keys(extractorProxies).sort((a, b) => a.localeCompare(b))) {
+        const entry = extractorProxies[name];
         let isFile = false, value = '';
         if (typeof entry === 'string') { value = entry; }
         else if (Array.isArray(entry)) { value = entry[0] || ''; }
@@ -807,7 +837,7 @@ function renderExtractorProxies() {
 function populateExtractorSelect(availableExtractors) {
     const sel = document.getElementById('new-extractor-name');
     sel.innerHTML = '<option value="">— Select extractor —</option>';
-    for (const name of availableExtractors) {
+    for (const name of [...availableExtractors].sort((a, b) => a.localeCompare(b))) {
         if (!extractorProxies[name]) {
             const opt = document.createElement('option');
             opt.value = name;
@@ -820,7 +850,7 @@ function populateExtractorSelect(availableExtractors) {
 function renderWarpOffToggles(available, warpOffList) {
     const container = document.getElementById('warp-off-list');
     container.innerHTML = '';
-    for (const name of available) {
+    for (const name of [...available].sort((a, b) => a.localeCompare(b))) {
         const isOff = warpOffList.includes(name);
         const btn = document.createElement('span');
         btn.className = 'warp-off-chip' + (isOff ? ' off' : '');
@@ -843,7 +873,7 @@ function renderWarpOffToggles(available, warpOffList) {
 function renderProxyOffToggles(available, proxyOffList) {
     const container = document.getElementById('proxy-off-list');
     container.innerHTML = '';
-    for (const name of available) {
+    for (const name of [...available].sort((a, b) => a.localeCompare(b))) {
         const isOff = proxyOffList.includes(name);
         const btn = document.createElement('span');
         btn.className = 'warp-off-chip' + (isOff ? ' off' : '');
@@ -861,6 +891,36 @@ function renderProxyOffToggles(available, proxyOffList) {
         };
         container.appendChild(btn);
     }
+}
+
+function renderMaxResToggles(available, maxResList) {
+    const container = document.getElementById('max-res-list');
+    container.innerHTML = '';
+    for (const name of [...available].sort((a, b) => a.localeCompare(b))) {
+        const isOn = maxResList.includes(name);
+        const btn = document.createElement('span');
+        btn.className = 'warp-off-chip' + (isOn ? '' : ' off');
+        btn.textContent = isOn ? name + ' · max' : name;
+        btn.onclick = async () => {
+            let newList;
+            if (maxResList.includes(name)) {
+                newList = maxResList.filter(x => x !== name);
+            } else {
+                newList = [...maxResList, name];
+            }
+            await saveField('max_res_extractors', newList);
+            config.max_res_extractors = newList;
+            renderMaxResToggles(available, newList);
+        };
+        container.appendChild(btn);
+    }
+}
+
+async function toggleMaxRes(kind) {
+    const key = 'max_res_' + kind;
+    const newVal = !config[key];
+    await saveField(key, newVal);
+    setToggle('max-res-' + kind + '-toggle', newVal);
 }
 
 function humanizeKey(key) {
@@ -977,8 +1037,13 @@ async function toggleWarp() {
 
 async function refreshWarpStatus() {
     try {
-        const r = await fetch('/api/admin/config');
+        const params = new URLSearchParams(window.location.search);
+        const pw = params.get('api_password');
+        const url = '/api/admin/config' + (pw ? '?api_password=' + encodeURIComponent(pw) : '');
+        const r = await fetch(url);
+        if (!r.ok) return;
         const data = await r.json();
+        if (!data.warp_status) return;
         config.warp_status = data.warp_status;
         config.warp_ip = data.warp_ip || '';
         const ws = document.getElementById('warp-status');
@@ -1284,5 +1349,6 @@ setInterval(async () => {
     }
 }, 5000);
 </script>
+<script src="/static/ep-nav.js"></script>
 </body>
 </html>
