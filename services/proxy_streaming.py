@@ -9,6 +9,7 @@ import config_store
 import config as _config
 from config import PROXY_SOURCE_LIST, find_first_alive_async, is_proxy_alive
 import services.proxy_shared as _shared
+import services.wg_tunnels as wg_tunnels
 from services.proxy_shared import (
     logger,
     web,
@@ -441,6 +442,7 @@ class HLSProxyStreamingMixin:
                 forced_proxy = None
                 _shared.BYPASS_PROXIES_CONTEXT.set(True)
                 logger.debug(f"🔍 [Segment-DEBUG] proxy=off detected, BYPASS_PROXIES_CONTEXT=True, bypass_warp={bypass_warp}")
+            forced_proxy = _config.resolve_proxy_alias(forced_proxy)
             forced_proxy = self._discard_disabled_warp_route(
                 forced_proxy, bypass_warp
             )
@@ -491,6 +493,8 @@ class HLSProxyStreamingMixin:
                             current_proxy,
                             extractor_key=request.query.get("extractor_key"),
                         )
+                        if await self._recover_tunnel_proxy(current_proxy):
+                            continue
                         new_proxy = get_proxy_for_url(segment_url, bypass_warp=bypass_warp)
                         if new_proxy and new_proxy != current_proxy:
                             current_proxy = new_proxy
@@ -625,6 +629,7 @@ class HLSProxyStreamingMixin:
             if force_direct or bypass_proxies
             else (forced_proxy or request.query.get("proxy") or None)
         )
+        forced_proxy = _config.resolve_proxy_alias(forced_proxy)
         forced_proxy = self._discard_disabled_warp_route(
             forced_proxy, bypass_warp
         )
@@ -1093,10 +1098,35 @@ class HLSProxyStreamingMixin:
 
                 if resp.status not in [200, 206]:
                     if resp.status == 403:
+                        # 1. Quick retry if it's a transient CDN error (e.g. Varnish cache miss with Retry-After on TikTok/live CDNs)
+                        if is_hls_segment_request:
+                            retry_after = resp.headers.get("Retry-After")
+                            x_cache = resp.headers.get("X-Cache", "")
+                            server_hdr = resp.headers.get("Server", "").lower()
+                            if retry_after is not None or "miss" in x_cache.lower() or "varnish" in server_hdr:
+                                for att in range(2):
+                                    await asyncio.sleep(0.5 * (att + 1))
+                                    try:
+                                        retry_target = yarl.URL(stream_url, encoded=True) if not is_special_cdn else urllib.parse.unquote(stream_url)
+                                        async with session.get(retry_target, headers=headers, ssl=not disable_ssl, timeout=segment_timeout) as quick_resp:
+                                            if quick_resp.status in (200, 206):
+                                                logger.info("✅ Transient CDN 403 resolved on retry %d for %s", att + 1, stream_url.split('/')[-1].split('?')[0])
+                                                q_body = await quick_resp.read()
+                                                q_headers = dict(quick_resp.headers)
+                                                q_headers["Access-Control-Allow-Origin"] = "*"
+                                                is_image = q_headers.get("content-type", "").startswith("image/") or q_body[:8] == b"\x89PNG\r\n\x1a\n"
+                                                if is_image or request.path.endswith(".ts") or stream_url.endswith(".ts"):
+                                                    q_body = await asyncio.to_thread(self._strip_fake_png_header_from_ts, q_body)
+                                                    set_response_header(q_headers, "Content-Type", "video/mp2t")
+                                                    set_response_header(q_headers, "Content-Length", str(len(q_body)))
+                                                return web.Response(body=q_body, status=quick_resp.status, headers=q_headers)
+                                    except Exception:
+                                        pass
+
                         rot_response = await retry_with_different_proxy()
                         if rot_response:
                             return rot_response
-                        # Last resort: re-extract to refresh signed CDN token (e.g. VidXgo)
+                        # Last resort: re-extract to refresh signed CDN token (e.g. VidXgo, DLStreams)
                         re_response = await self._reextract_and_retry_segment(
                             request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl
                         )
@@ -1120,11 +1150,13 @@ class HLSProxyStreamingMixin:
                                 status=retry_result["status"],
                                 headers=retry_headers,
                             )
-                    if resp.status == 403 and request.path.endswith("manifest.m3u8"):
-                        logger.debug(
-                            "Upstream 403 on manifest, skipping recovery (browser fallback disabled) [%s]",
-                            log_context(session_proxy or forced_proxy),
+                    if resp.status == 403 and ("manifest.m3u8" in request.path or "playlist" in request.path):
+                        re_manifest_resp = await self._reextract_and_retry_manifest(
+                            request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl, extractor_key, stream_key
                         )
+                        if re_manifest_resp:
+                            return re_manifest_resp
+
                     error_body = await resp.content.read(4096) or b""
                     routing = safe_log_route(session_proxy or forced_proxy)
                     logger.warning(
@@ -1524,6 +1556,23 @@ class HLSProxyStreamingMixin:
                     active_proxy,
                     extractor_key=request.query.get("extractor_key"),
                 )
+                if await self._recover_tunnel_proxy(active_proxy):
+                    if not getattr(request, "_ps_retried", False):
+                        request._ps_retried = True
+                        logger.warning(
+                            "Tunnel proxy reconnected; retrying request once [%s]",
+                            log_context(active_proxy),
+                        )
+                        return await self._proxy_stream(
+                            request,
+                            stream_url,
+                            stream_headers,
+                            bypass_warp=bypass_warp,
+                            forced_proxy=forced_proxy,
+                            force_direct=force_direct,
+                            extractor_key=extractor_key,
+                            stream_key=stream_key,
+                        )
             if active_proxy and getattr(_shared, 'WARP_PROXY_URL', None) and active_proxy == _shared.WARP_PROXY_URL:
                 warp_healthy, warp_reason = await self._probe_warp(timeout_sec=3)
                 if not warp_healthy:
@@ -1587,7 +1636,8 @@ class HLSProxyStreamingMixin:
                         forced_proxy,
                         extractor_key=request.query.get("extractor_key"),
                     )
-                    if not is_proxy_alive(forced_proxy):
+                    recovered = await self._recover_tunnel_proxy(forced_proxy)
+                    if recovered or not is_proxy_alive(forced_proxy):
                         logger.warning(
                             "Proxy failed, triggering re-extraction [%s]",
                             log_context(forced_proxy),
@@ -1614,6 +1664,74 @@ class HLSProxyStreamingMixin:
                     inflight.pop(coalesce_key, None)
                 if not coalesce_future.done():
                     coalesce_future.set_result(None)
+
+    async def _reextract_and_retry_manifest(
+        self, request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl, extractor_key, stream_key
+    ):
+        """Re-extract the source on 403 when upstream manifest token has expired."""
+        orig_url = request.query.get("orig_url")
+        if not orig_url:
+            return None
+
+        # Prevent recursive re-extraction loop
+        if getattr(request, "_manifest_reextracted", False):
+            return None
+        request._manifest_reextracted = True
+
+        logger.info(
+            "🔄 [Manifest 403] Upstream manifest token expired, re-extracting %s",
+            orig_url,
+        )
+        try:
+            extractor = await self.get_extractor(orig_url, headers, bypass_warp=bypass_warp)
+            if not extractor:
+                return None
+
+            refreshed = await extractor.extract(
+                orig_url,
+                force_refresh=True,
+                request_headers=headers,
+                bypass_warp=bypass_warp,
+                proxy=forced_proxy,
+            )
+            if not refreshed or not refreshed.get("destination_url"):
+                return None
+
+            new_stream_url = refreshed["destination_url"]
+            new_headers = refreshed.get("request_headers") or headers
+            logger.info(
+                "✅ [Manifest Recovered] Re-extraction succeeded: %s -> %s",
+                stream_url[:60],
+                new_stream_url[:60],
+            )
+
+            # Update live CDN token for stream_key so segments get the fresh token
+            if stream_key:
+                old_base_dir = stream_url.rsplit("/", 1)[0] + "/"
+                new_base_dir = new_stream_url.rsplit("/", 1)[0] + "/"
+                new_qs = ""
+                if "?" in new_stream_url:
+                    new_qs = "?" + new_stream_url.split("?", 1)[1]
+                self._renewed_cdn_tokens[stream_key] = (old_base_dir, new_base_dir, new_qs)
+                self._renewed_cdn_token_atimes[stream_key] = time.time()
+                logger.info(
+                    "🔑 Updated CDN token for stream_key=%s via manifest refresh",
+                    stream_key[:8],
+                )
+
+            return await self._proxy_stream(
+                request,
+                new_stream_url,
+                new_headers,
+                bypass_warp=bypass_warp,
+                forced_proxy=forced_proxy,
+                force_direct=force_direct,
+                extractor_key=extractor_key,
+                stream_key=stream_key,
+            )
+        except Exception as exc:
+            logger.warning("Manifest re-extraction failed: %s", exc)
+            return None
 
     async def _reextract_and_retry_segment(
         self, request, stream_url, headers, bypass_warp, forced_proxy, force_direct, disable_ssl
@@ -1678,6 +1796,13 @@ class HLSProxyStreamingMixin:
             if fresh_url:
                 break
 
+        # Fallback: if fresh_url not in captured_manifests, but master_url has a new query string
+        # (e.g. for barecrop/assetrage / tokenized HLS where the query token refreshed)
+        if not fresh_url and master_url and "?" in master_url:
+            new_q = master_url.split("?", 1)[1]
+            fresh_url = stream_url.split("?", 1)[0] + "?" + new_q
+            logger.info("Re-extract: updated segment token from playlist URL for %s", seg_filename)
+
         if not fresh_url or fresh_url.rsplit("/", 1)[-1].split("?")[0] != seg_filename:
             logger.debug(
                 "Re-extract: could not locate %s in refreshed manifest [%s]",
@@ -1730,7 +1855,14 @@ class HLSProxyStreamingMixin:
                     )
                     return None
                 body = await fr_resp.read()
-                rh = {"Access-Control-Allow-Origin": "*", "Content-Type": "video/mp2t"}
+                is_image = fr_resp.headers.get("content-type", "").startswith("image/") or body[:8] == b"\x89PNG\r\n\x1a\n"
+                if is_image or request.path.endswith(".ts") or stream_url.endswith(".ts"):
+                    body = await asyncio.to_thread(self._strip_fake_png_header_from_ts, body)
+                rh = {
+                    "Access-Control-Allow-Origin": "*",
+                    "Content-Type": "video/mp2t",
+                    "Content-Length": str(len(body)),
+                }
                 logger.info(
                     "✅ Segment recovered via re-extract: %s [%s]",
                     seg_filename,
@@ -1831,6 +1963,7 @@ class HLSProxyStreamingMixin:
             if forced_proxy and forced_proxy.lower() == "off":
                 forced_proxy = None
                 _shared.BYPASS_PROXIES_CONTEXT.set(True)
+            forced_proxy = _config.resolve_proxy_alias(forced_proxy)
             forced_proxy = self._discard_disabled_warp_route(
                 forced_proxy, bypass_warp
             )
@@ -1964,27 +2097,38 @@ class HLSProxyStreamingMixin:
                 # The WARP keepalive uses a separate session, so it can be
                 # healthy while this long-lived pooled connector is stale.
                 # Recreate that connector and remain on WARP for the retry.
+                # Local WireGuard tunnels get the same retry after an inline
+                # reconnect, since their SOCKS bind is restarted on failure.
+                retryable = bool(init_retryable or segment_retryable)
                 can_retry_warp = (
                     segment_proxy
                     and segment_proxy == _shared.WARP_PROXY_URL
-                    and (init_retryable or segment_retryable)
+                    and retryable
                 )
+                tunnel_slot = (
+                    None
+                    if (can_retry_warp or not segment_proxy or not retryable)
+                    else wg_tunnels.slot_for_proxy_url(segment_proxy)
+                )
+                if tunnel_slot:
+                    can_retry_warp = await self._recover_tunnel_proxy(segment_proxy)
                 if can_retry_warp:
-                    await self._invalidate_proxy_session(
-                        segment_proxy,
-                        session_key=stream_session_key,
-                    )
-                    warp_healthy, warp_reason = await self._probe_warp(timeout_sec=3)
-                    if not warp_healthy:
-                        logger.warning(
-                            "WARP health probe failed; retrying after socket recovery check [%s]",
-                            request_log_context(
-                                request,
-                                url or init_url,
-                                route=safe_log_route(segment_proxy),
-                            ),
+                    if not tunnel_slot:
+                        await self._invalidate_proxy_session(
+                            segment_proxy,
+                            session_key=stream_session_key,
                         )
-                        await self._restart_warp_if_socket_unhealthy(warp_reason)
+                        warp_healthy, warp_reason = await self._probe_warp(timeout_sec=3)
+                        if not warp_healthy:
+                            logger.warning(
+                                "WARP health probe failed; retrying after socket recovery check [%s]",
+                                request_log_context(
+                                    request,
+                                    url or init_url,
+                                    route=safe_log_route(segment_proxy),
+                                ),
+                            )
+                            await self._restart_warp_if_socket_unhealthy(warp_reason)
 
                     retry_session, retry_proxy = await self._get_proxy_session(
                         url or init_url,
@@ -2024,11 +2168,11 @@ class HLSProxyStreamingMixin:
                         and (not segment_retryable or segment_content is not None)
                     ):
                         logger.warning(
-                            "Recovered ClearKey segment request through a fresh WARP session [%s]",
+                            "Recovered ClearKey segment request through a fresh proxy session [%s]",
                             request_log_context(
                                 request,
                                 url or init_url,
-                                route="WARP",
+                                route=safe_log_route(segment_proxy),
                             ),
                         )
                 elif not segment_proxy and (init_retryable or segment_retryable):

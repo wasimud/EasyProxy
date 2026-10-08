@@ -1,3 +1,4 @@
+from urllib.parse import urlparse
 from utils.packed import eval_solver
 from extractors.base import BaseExtractor, ExtractorError
 
@@ -9,6 +10,7 @@ class FastreamExtractor(BaseExtractor):
 
     async def extract(self, url: str, **kwargs) -> dict:
         """Extract Fastream URL."""
+        self._apply_routing_kwargs(url, kwargs)
         session = await self._get_session(url)
         
         headers = {
@@ -19,9 +21,22 @@ class FastreamExtractor(BaseExtractor):
         }
         patterns = [r'file:"(.*?)"']
 
-        final_url = await eval_solver(session, url, headers, patterns)
-
         domain = url.replace('https://', '').split('/')[0]
+        code = urlparse(url).path.rstrip('/').split('/')[-1].split('-')[-1]
+        if code.endswith('.html'):
+            code = code[:-5]
+
+        # La pagina embed non contiene più il player inline: fa una POST a /dl
+        # (op=embed) che risponde col JS packed contenente l'URL HLS.
+        final_url = await eval_solver(
+            session,
+            f"https://{domain}/dl",
+            headers,
+            patterns,
+            method="POST",
+            data={"op": "embed", "file_code": code, "auto": "1", "referer": url},
+        )
+
         self.base_headers["referer"] = f"https://{domain}/"
         self.base_headers["origin"] = f"https://{domain}"
         self.base_headers["Accept-Language"] = "en-US,en;q=0.5"
@@ -31,6 +46,9 @@ class FastreamExtractor(BaseExtractor):
             "destination_url": final_url,
             "request_headers": self.base_headers,
             "mediaflow_endpoint": self.mediaflow_endpoint,
+            "selected_proxy": self.last_used_proxy,
+            "force_direct": self._force_direct,
+            "bypass_warp": self.bypass_warp_active,
         }
 
     async def close(self):

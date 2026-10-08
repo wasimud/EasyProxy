@@ -14,12 +14,18 @@ The CDN serves the manifest without any Referer/Origin enforcement, so no
 special playback headers are required.
 """
 
+import base64
+import json
 import logging
 import re
 
 from extractors.base import BaseExtractor, ExtractorError
 
 logger = logging.getLogger(__name__)
+
+# New player (vixeo.io) embeds the source in a base64 JSON data-config attribute:
+# <div id="streamsonic-player-root" data-config="eyJzb3VyY2UiOi...">
+_CONFIG_DATA_RE = re.compile(r'data-config="([^"]+)"')
 
 # Matches the obfuscated hex-pipe string literal assigned in the page script.
 # Each '|'-separated chunk is a run of hex digits (variable length); the decoder
@@ -64,7 +70,21 @@ class VidSonicExtractor(BaseExtractor):
             return m.group(1)
         return None
 
+    @classmethod
+    def _source_from_config(cls, html: str) -> str | None:
+        """Read ``source`` from the new StreamSonic player config attribute."""
+        m = _CONFIG_DATA_RE.search(html)
+        if not m:
+            return None
+        try:
+            config = json.loads(base64.b64decode(m.group(1)))
+        except Exception:
+            return None
+        source = config.get("source")
+        return source if isinstance(source, str) and source else None
+
     async def extract(self, url: str, **kwargs) -> dict:
+        self._apply_routing_kwargs(url, kwargs)
         headers = {
             "User-Agent": self.base_headers["User-Agent"],
             "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -74,7 +94,7 @@ class VidSonicExtractor(BaseExtractor):
         resp = await self._make_request(url, headers=headers, retries=2)
         html = resp.text or ""
 
-        blob = self._find_blob(html)
+        blob = self._source_from_config(html) or self._find_blob(html)
         if not blob:
             # Last resort: make sure a decoder is actually present before
             # trying other literals.
@@ -86,7 +106,7 @@ class VidSonicExtractor(BaseExtractor):
                 raise ExtractorError(f"VidSonic: no obfuscated URL in {url}")
             blob = max(candidates, key=len)
 
-        stream_url = self._decode(blob)
+        stream_url = blob if blob.startswith("http") else self._decode(blob)
         if "m3u8" not in stream_url and "mp4" not in stream_url:
             raise ExtractorError(f"VidSonic: decoded value is not a media URL: {stream_url[:80]}")
 
@@ -95,6 +115,9 @@ class VidSonicExtractor(BaseExtractor):
             "destination_url": stream_url,
             "request_headers": {},
             "mediaflow_endpoint": self.mediaflow_endpoint,
+            "selected_proxy": self.last_used_proxy,
+            "force_direct": self._force_direct,
+            "bypass_warp": self.bypass_warp_active,
         }
 
     async def close(self):

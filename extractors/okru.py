@@ -10,6 +10,7 @@ class OkruExtractor(BaseExtractor):
 
     async def extract(self, url: str, **kwargs) -> dict:
         """Extract Okru URL."""
+        self._apply_routing_kwargs(url, kwargs)
         resp = await self._make_request(url)
         text = resp.text
 
@@ -21,7 +22,9 @@ class OkruExtractor(BaseExtractor):
             
             data_options = div.get("data-options")
             data = json.loads(data_options)
-            metadata = json.loads(data["flashvars"]["metadata"])
+            metadata = data["flashvars"]["metadata"]
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
             final_url = (
                 metadata.get("hlsMasterPlaylistUrl") or metadata.get("hlsManifestUrl") or metadata.get("ondemandHls")
             )
@@ -34,6 +37,9 @@ class OkruExtractor(BaseExtractor):
                 "destination_url": final_url,
                 "request_headers": self.base_headers,
                 "mediaflow_endpoint": self.mediaflow_endpoint,
+                "selected_proxy": self.last_used_proxy,
+                "force_direct": self._force_direct,
+                "bypass_warp": self.bypass_warp_active,
             }
         
         raise ExtractorError("Failed to parse OK.ru page")

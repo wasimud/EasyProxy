@@ -77,6 +77,7 @@ class HLSProxyExtractorHandlerMixin:
             selected_proxy = urllib.parse.unquote(raw_proxy)
             if "://" not in selected_proxy and "%3a" in selected_proxy.lower():
                 selected_proxy = urllib.parse.unquote(selected_proxy)
+            selected_proxy = _config.resolve_proxy_alias(selected_proxy)
         if selected_proxy and _config.is_warp_proxy_url(selected_proxy) and (
             bypass_warp or not _config._get_dynamic_warp_enabled()
         ):
@@ -139,16 +140,19 @@ class HLSProxyExtractorHandlerMixin:
                         "turbovidplay",
                         "livetv",
                         "f16px",
+                        "byse (alias of f16px)",
                         "guardabest",
                         "mediaset",
                         "wittytv",
                         "raiplay",
                         "cinejoy",
+                        "fctv33",
                     ],
                     "examples": [
                         f"{get_public_base_url(request)}/extractor/video?d=https://vavoo.to/channel/123",
                         f"{get_public_base_url(request)}/extractor/video.m3u8?host=vavoo&d=https://custom-link.com",
                         f"{get_public_base_url(request)}/extractor/video.mp4?host=mixdrop&d=https://mixdrop.co/e/ABC123XYZ",
+                        f"{get_public_base_url(request)}/extractor/video?host=fctv33&d=https://fctv33.stream/match/123/stream/456",
                         f"{get_public_base_url(request)}/extractor/video?d=BASE64_STRING",
                     ],
                 }
@@ -190,6 +194,8 @@ class HLSProxyExtractorHandlerMixin:
             extractor_kwargs = dict(request.query)
             extractor_kwargs.pop('url', None) # Remove to avoid duplicate argument error
             extractor_kwargs.pop('d', None)   # Remove to avoid duplicate argument error
+            if selected_proxy:
+                extractor_kwargs['proxy'] = selected_proxy
             extractor_kwargs['request_headers'] = dict(request.headers)
 
             logger.debug(f"Extractor Debug: Initial bypass_warp from query: {bypass_warp}")

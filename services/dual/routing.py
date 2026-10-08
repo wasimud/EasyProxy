@@ -15,6 +15,7 @@ from config import (
     SELECTED_PROXY_CONTEXT,
     STRICT_PROXY_CONTEXT,
     get_proxy_for_url,
+    resolve_proxy_alias,
 )
 
 
@@ -67,8 +68,11 @@ class RoutingOptions:
 
         # Explicit proxies command over WARP. proxy=off must disable even a
         # forced proxy so the resolver can select WARP instead.
-        if self.forced_proxy and not bypass_proxies:
+        # ponytail: proxy_exclude_domains drops even explicit ?proxy= (WARP exempt)
+        if config_module.effective_forced_proxy(url, self.forced_proxy) and not bypass_proxies:
             return self.forced_proxy
+
+        bypass_proxies = bypass_proxies or config_module._is_proxy_excluded(url or "")
 
         bypass_warp_token = BYPASS_WARP_CONTEXT.set(bypass_warp)
         bypass_proxy_token = BYPASS_PROXIES_CONTEXT.set(bypass_proxies)
@@ -96,7 +100,7 @@ def from_values(*sources: Mapping | None) -> RoutingOptions:
             values.update(source)
 
     raw_proxy = values.get("proxy") or values.get("proxy_url") or ""
-    raw_proxy = unquote(str(raw_proxy).strip())
+    raw_proxy = resolve_proxy_alias(unquote(str(raw_proxy).strip()))
     proxy_off = (
         str(raw_proxy).lower() == "off"
         or _as_bool(values.get("proxy_off"))
