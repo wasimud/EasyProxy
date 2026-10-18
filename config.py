@@ -46,7 +46,7 @@ _SOCKET_CHECK_EXECUTOR = ThreadPoolExecutor(
 )
 
 
-APP_VERSION = "2.13.30"
+APP_VERSION = "2.13.51"
 
 _MEMORY_PROFILE_FRAMES = 15
 _memory_profile_baseline = None
@@ -654,7 +654,7 @@ async def is_proxy_alive_async(proxy_url: str, force_check: bool = False) -> boo
     if not proxy_url:
         return False
     now = time.time()
-    async with _proxy_async_lock:
+    with _proxy_lock:
         if proxy_url in DEAD_PROXIES:
             expire_time = DEAD_PROXIES[proxy_url]
             if now < expire_time:
@@ -673,18 +673,15 @@ async def is_proxy_alive_async(proxy_url: str, force_check: bool = False) -> boo
 
 def _socks5_greeting(host: str, port: int, timeout: float = 5) -> bool:
     """Perform SOCKS5 greeting handshake to verify proxy speaks SOCKS5."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
     try:
-        sock.connect((host, port))
-        # greeting: version=5, 1 auth method, no-auth=0
-        sock.sendall(bytes([0x05, 0x01, 0x00]))
-        resp = sock.recv(2)
-        return len(resp) == 2 and resp[0] == 0x05 and resp[1] == 0x00
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            # Offer No-Auth (0x00) and Username/Password (0x02)
+            sock.sendall(bytes([0x05, 0x02, 0x00, 0x02]))
+            resp = sock.recv(2)
+            return len(resp) == 2 and resp[0] == 0x05 and resp[1] in (0x00, 0x02)
     except OSError:
         return False
-    finally:
-        sock.close()
 
 
 def _socket_check(proxy_url: str, timeout: float = 5) -> bool:
@@ -705,9 +702,17 @@ def mark_proxy_dead(proxy_url: str, dead_duration: int = 300):
     if not proxy_url:
         return
 
-    _WARP_PROXY_URL = WARP_PROXY_URL
-    if _WARP_PROXY_URL and is_warp_proxy_url(proxy_url):
-        logging.warning("WARP proxy %s failure observed; keeping it managed by socket health checks.", proxy_url)
+    # WARP, Tor and the WireGuard tunnels (nordvpn/custom) are local, managed
+    # endpoints: a failed request (timeout, circuit churn, extractor error) says
+    # nothing about the SOCKS listener. Health is decided by the socket check
+    # only, so never park them in the dead cache.
+    if is_managed_tunnel_proxy_url(proxy_url):
+        if WARP_PROXY_URL and is_warp_proxy_url(proxy_url):
+            logging.warning("WARP proxy %s failure observed; keeping it managed by socket health checks.", proxy_url)
+        else:
+            logging.info("Local tunnel proxy %s failure observed; keeping it managed by socket health checks.", proxy_url)
+        with _proxy_lock:
+            DEAD_PROXIES.pop(proxy_url, None)
         return
 
     # If this is the only custom proxy configured in the system, do not mark it dead.
@@ -723,6 +728,8 @@ def mark_proxy_dead(proxy_url: str, dead_duration: int = 300):
                 extractor_list.append(val)
             elif isinstance(val, list):
                 extractor_list.extend(val)
+            elif isinstance(val, dict) and "file" in val:
+                extractor_list.extend(_read_proxy_source(val["file"]))
                 
         transport_list = []
         for route in transport_routes:
@@ -731,7 +738,8 @@ def mark_proxy_dead(proxy_url: str, dead_duration: int = 300):
                 if p_val:
                     transport_list.append(p_val)
                     
-        custom_pool = {p for p in (global_proxies + extractor_list + transport_list) if p}
+        source_list = list(PROXY_SOURCE_LIST.get() or [])
+        custom_pool = {p for p in (global_proxies + extractor_list + transport_list + source_list) if p}
         if len(custom_pool) <= 1:
             logging.info("Proxy %s failed, but it is the only custom proxy configured. Not marking dead.", proxy_url)
             return
@@ -839,15 +847,21 @@ def get_connector_for_proxy(proxy_url: str, **kwargs):
         WARP_LAST_ACTIVITY = time.monotonic()
 
     connector_url = proxy_url
-    rdns = kwargs.pop("rdns", False)
+    rdns = kwargs.pop("rdns", None)
 
     if connector_url.startswith("socks5h://"):
         connector_url = connector_url.replace("socks5h://", "socks5://")
         rdns = True
+    elif connector_url.startswith("socks5://"):
+        if rdns is None:
+            rdns = True
     elif connector_url.startswith("socks4a://"):
         connector_url = connector_url.replace("socks4a://", "socks4://")
         rdns = True
     elif connector_url.startswith("socks4://"):
+        if rdns is None:
+            rdns = False
+    elif rdns is None:
         rdns = False
 
     # Keep upstream connections reusable. Reopening a SOCKS+TLS connection
@@ -918,6 +932,47 @@ def is_warp_proxy_url(proxy_url: str | None) -> bool:
         return value
 
     return canonical(proxy_url) == canonical(WARP_PROXY_URL)
+
+
+def _proxy_matches_bind(proxy_url: str, bind: str) -> bool:
+    """True when a proxy URL points at a host:port bind (loopback aliases included)."""
+    if not bind:
+        return False
+    host, _, bind_port = bind.rpartition(":")
+    if not host or not bind_port.isdigit():
+        return False
+    try:
+        parsed = urllib.parse.urlparse(str(proxy_url).strip())
+        port = parsed.port
+    except ValueError:
+        return False
+    if not parsed.hostname or not port:
+        return False
+    loopback = {"127.0.0.1", "localhost", "::1"}
+    bind_host = host.strip("[]").lower()
+    proxy_host = parsed.hostname.strip("[]").lower()
+    if bind_host != proxy_host and not (bind_host in loopback and proxy_host in loopback):
+        return False
+    return port == int(bind_port)
+
+
+def is_managed_tunnel_proxy_url(proxy_url: str | None) -> bool:
+    """Return True for a locally managed tunnel endpoint: WARP, Tor or a WireGuard slot."""
+    if not proxy_url:
+        return False
+    if WARP_PROXY_URL and is_warp_proxy_url(proxy_url):
+        return True
+    raw = str(proxy_url).strip()
+    try:
+        if not urllib.parse.urlparse(raw).hostname:
+            raw = "socks://" + raw
+        from services import tor_proxy, wg_tunnels
+
+        if wg_tunnels.slot_for_proxy_url(raw):
+            return True
+        return _proxy_matches_bind(raw, str(tor_proxy.get_bind() or ""))
+    except Exception:
+        return False
 
 
 def get_solver_proxy_url(proxy_url: str | None) -> str | None:

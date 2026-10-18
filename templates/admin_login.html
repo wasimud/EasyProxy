@@ -94,6 +94,7 @@
         display: none;
     }
 </style>
+    <link rel="stylesheet" href="/static/ep-ui.css">
 </head>
 <body>
 <canvas id="particles"></canvas>
@@ -138,5 +139,6 @@ async function login() {
     } catch(e) { err.textContent='Errore di connessione'; err.style.display='block'; }
 }
 </script>
+<script src="/static/ep-nav.js?v={{APP_VERSION}}"></script>
 </body>
 </html>

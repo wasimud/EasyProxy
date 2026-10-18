@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import codecs
+import hashlib
 import json
 import logging
 import os
@@ -21,10 +23,10 @@ logger = logging.getLogger(__name__)
 AES_KEY = b"a7981cc9eb2f4d19dcfea57b101ecd89"
 AES_IV = b"8017d3a8f1400d2f"
 
-DEFAULT_DATA_API_BASE = "https://apis-data10.tcdru136ovur.ru"
+DEFAULT_DATA_API_BASE = "https://apis-data10.tcpwe138stya.ru"
 DEFAULT_PLAYER_REFERER = "https://nadia01eo.tn76degree12ec3out.cfd/"
 DEFAULT_STREAM_DIGIT = "seth"
-SITE_URL = "https://www.fctv33hd.rest"
+DOMAINS_CONFIG_URL = "https://raw.githubusercontent.com/realbestia1/domains/refs/heads/main/domains.json"
 
 # sport slug (event page path segment) -> sportType id (from site JS enum: ST_FOOTBALL=1 ...)
 SPORT_SLUG_MAP = {
@@ -150,6 +152,99 @@ def build_signed_stream_url(obfuscated_url: str, session_token: str) -> str:
     path_with_token = f"/token-{token}{parsed.path}"
     query = f"?{parsed.query}" if parsed.query else ""
     return f"{parsed.scheme}://{parsed.netloc}{path_with_token}{query}"
+
+
+# Salt used for the _s2 segment signature. FCTV33 publishes it in the site config
+# (common:cdnSmartLink -> auth.salt). The extractor stores the fetched value here so
+# that the stateless signing helpers (used by the manifest rewriter and the proxy
+# streamer, which never see the extractor instance) sign with the live salt.
+DEFAULT_S2_SALT = "00"
+_current_s2_salt = DEFAULT_S2_SALT
+
+
+def set_current_s2_salt(salt) -> None:
+    """Update the shared _s2 salt (ignored when empty)."""
+    global _current_s2_salt
+    if salt is None or salt == "":
+        return
+    _current_s2_salt = str(salt)
+
+
+def get_current_s2_salt() -> str:
+    return _current_s2_salt
+
+
+def decode_rot13_b64(s: str, is_slice: bool = True) -> str:
+    """Decode FCTV33 obfuscated parameters (_ctump, _ctuph) via ROT13 and Base64."""
+    if not s:
+        return s
+    s2 = s[8:] if is_slice and len(s) > 8 else s
+    try:
+        rot = codecs.decode(s2, "rot_13")
+        return base64.b64decode(rot).decode("utf-8", errors="replace")
+    except Exception:
+        return s
+
+
+def sign_s2_token(url: str, salt: str | None = None) -> str:
+    """Sign segment URL with _s2 signature parameter required by FCTV33 TencentEdgeOne CDN."""
+    if salt is None:
+        salt = _current_s2_salt
+    try:
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "_s2" in qs:
+            return url
+        ver = qs.get("_ver", [""])[0]
+        if not ver:
+            return url
+        filename = parsed.path.split("/")[-1]
+        payload = f"{filename},{ver},{salt}"
+        s2 = hashlib.md5(payload.encode("utf-8")).hexdigest()
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}_s2={s2}"
+    except Exception:
+        return url
+
+
+def resolve_fctv33_segment_url(url: str, geo_country: str = "IT", geo_continent: str = "EU", salt: str | None = None) -> str:
+    """Resolve FCTV33 segment URL (_ctump / _ctuph smart link) and append _s2 signature."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        ctump = qs.get("_ctump", [""])[0]
+        ctuph = qs.get("_ctuph", [""])[0]
+        if not ctump or not ctuph:
+            return sign_s2_token(url, salt=salt)
+
+        decoded_ctump = decode_rot13_b64(ctump)
+        decoded_ctuph = decode_rot13_b64(ctuph)
+
+        # Parse host entries: e.g. "EU-IT:cf@host1,EU:cf@host2,WW:cf@host3"
+        chosen_host = None
+        ww_host = None
+        items = decoded_ctump.split(",")
+        for item in items:
+            if ":" in item and "@" in item:
+                ccode, rest = item.split(":", 1)
+                _, host = rest.split("@", 1)
+                if ccode == f"{geo_continent}-{geo_country}" or ccode == geo_country:
+                    chosen_host = host
+                    break
+                elif ccode == geo_continent and not chosen_host:
+                    chosen_host = host
+                elif ccode == "WW":
+                    ww_host = host
+
+        target_host = chosen_host or ww_host or (items[0].split("@")[-1] if "@" in items[0] else None)
+        if not target_host:
+            return sign_s2_token(url, salt=salt)
+
+        target_url = f"https://{target_host}{decoded_ctuph}"
+        return sign_s2_token(target_url, salt=salt)
+    except Exception as e:
+        logger.warning(f"Failed to resolve FCTV33 segment URL: {e}")
+        return url
 
 
 def read_varint(buffer: bytes, offset: int = 0):
@@ -350,7 +445,7 @@ class Fctv33Extractor(BaseExtractor):
     """
 
     def __init__(self, request_headers: dict = None, proxies: list = None, bypass_warp: bool = False):
-        super().__init__(request_headers or {}, proxies=proxies, extractor_name="fctv33")
+        super().__init__(request_headers or {}, proxies=proxies, extractor_name="fctv33", bypass_warp=bypass_warp)
         self.base_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept": "*/*",
@@ -358,11 +453,14 @@ class Fctv33Extractor(BaseExtractor):
         self.data_api_base = os.getenv("FCTV_DATA_API", DEFAULT_DATA_API_BASE)
         self.player_referer = DEFAULT_PLAYER_REFERER
         self.stream_digit = DEFAULT_STREAM_DIGIT
+        self.salt = "00"
         self.geo = {"country": "IT", "continent": "EU"}
         self._params_ts = 0
         self._init_lock = asyncio.Lock()
         self.mediaflow_endpoint = "hls_proxy"
+        self._init_bypass_warp = bool(bypass_warp)
         self.bypass_warp_active = bool(bypass_warp)
+        self._last_computed_bypass_warp = self.bypass_warp_active
         self.last_used_proxy = None
         self._forced_proxy = None
         self._force_direct = False
@@ -379,7 +477,7 @@ class Fctv33Extractor(BaseExtractor):
                 proxy_url = None
         else:
             proxy_url = await get_preferred_proxy_for_url(url, self.extractor_name, self.proxies or _cfg.GLOBAL_PROXIES, self.bypass_warp_active)
-        if proxy_url is None and not _cfg.is_direct_connection_allowed(self.bypass_warp_active):
+        if proxy_url is None and not force_direct and not _cfg.is_direct_connection_allowed(self.bypass_warp_active):
             raise ExtractorError("FCTV33: direct fallback disabled; no proxy route available")
         async with self._session_lock:
             self.session = self._route_sessions.get(proxy_url)
@@ -402,12 +500,20 @@ class Fctv33Extractor(BaseExtractor):
                 return
             try:
                 session = await self._get_session(self.data_api_base)
+                site_url = ""
+                try:
+                    cfg_resp = await self._make_request(
+                        DOMAINS_CONFIG_URL, headers={"Accept": "application/json"}, retries=1)
+                    site_url = str(cfg_resp.json.get("fctv33") or "").strip().rstrip("/")
+                except Exception as e:
+                    logger.warning(f"Fctv33Extractor: Failed to fetch domains config ({e}), no Referer/Origin")
                 cfg_url = f"{self.data_api_base}/api/common/params"
                 headers = {
                     "User-Agent": self.base_headers["User-Agent"],
-                    "Referer": f"{SITE_URL}/",
-                    "Origin": SITE_URL,
                 }
+                if site_url:
+                    headers["Referer"] = f"{site_url}/"
+                    headers["Origin"] = site_url
                 async with session.get(cfg_url, headers=headers, timeout=ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         text = await resp.text()
@@ -420,6 +526,15 @@ class Fctv33Extractor(BaseExtractor):
                                 self.player_referer = f"https://{domain_list[0].rstrip('/')}/"
                                 logger.info(f"Fctv33Extractor: Updated stream_digit={digit}, referer={self.player_referer}")
                                 break
+                        try:
+                            smart_link = json.loads(cfg.get("common:cdnSmartLink", "{}"))
+                            auth_salt = smart_link.get("auth", {}).get("salt")
+                            if auth_salt:
+                                self.salt = auth_salt
+                                set_current_s2_salt(auth_salt)
+                                logger.info("Fctv33Extractor: Updated _s2 salt")
+                        except Exception:
+                            pass
                         self._params_ts = now
             except Exception as e:
                 logger.warning(f"Fctv33Extractor: Failed to refresh player params ({e}), using defaults")
@@ -495,19 +610,28 @@ class Fctv33Extractor(BaseExtractor):
         need_event = not match_id or not stream_id
 
         # Merge per-request routing (proxy_streaming re-extract) + contexts + cached flag, like Cinejoy
+        if self.bypass_warp_active != getattr(self, "_last_computed_bypass_warp", self._init_bypass_warp):
+            self._init_bypass_warp = bool(self.bypass_warp_active)
         raw_proxy = kwargs.get("proxy")
-        bypass_proxies = str(raw_proxy or "").lower() in {"off", "none", "no"} or _cfg.BYPASS_PROXIES_CONTEXT.get()
-        bypass_warp = bool(kwargs.get("bypass_warp") or str(kwargs.get("warp", "")).lower() == "off" or _cfg.BYPASS_WARP_CONTEXT.get() or self.bypass_warp_active)
+        raw_proxy_norm = str(raw_proxy or "").strip().lower()
+        bypass_proxies = raw_proxy_norm in {"off", "none", "no", "false", "0", "direct"} or _cfg.BYPASS_PROXIES_CONTEXT.get()
+        warp_off = bool(kwargs.get("bypass_warp") or str(kwargs.get("warp", "")).strip().lower() in {"off", "false", "0"})
+        direct_flag = str(kwargs.get("direct", "")).strip().lower() in {"1", "true", "yes", "on"} or raw_proxy_norm == "direct"
+        bypass_warp = bool(warp_off or direct_flag or _cfg.BYPASS_WARP_CONTEXT.get() or self._init_bypass_warp)
         self.bypass_warp_active = bypass_warp
-        direct_requested = str(kwargs.get("direct", "")).lower() in {"1", "true", "yes", "on"} or (bypass_proxies and bypass_warp)
+        self._last_computed_bypass_warp = bypass_warp
+        direct_requested = direct_flag or (bypass_proxies and bypass_warp)
         if direct_requested or (bypass_proxies and bypass_warp):
             self._forced_proxy, self._force_direct = None, True
         elif bypass_proxies:
             self._forced_proxy, self._force_direct = (_cfg.WARP_PROXY_URL if _cfg._get_dynamic_warp_enabled() else None), False
             if not self._forced_proxy:
                 self._force_direct = True
-        elif raw_proxy and str(raw_proxy).lower() not in {"on", "auto", "true", ""}:
-            self._forced_proxy, self._force_direct = str(raw_proxy), False
+        elif raw_proxy and raw_proxy_norm not in {"on", "auto", "true", ""}:
+            resolved = _cfg.resolve_proxy_alias(str(raw_proxy).strip())
+            if resolved and "://" not in resolved:
+                resolved = f"socks5h://{resolved}"
+            self._forced_proxy, self._force_direct = str(resolved), False
         else:
             self._forced_proxy, self._force_direct = None, False
         # ponytail: proxy_exclude_domains drops even explicit ?proxy= (WARP exempt)

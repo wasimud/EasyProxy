@@ -9,14 +9,10 @@ from urllib.parse import urljoin, urlparse
 from curl_cffi.requests import AsyncSession
 from config import get_preferred_proxy_for_url
 import config as _cfg
-from extractors.base import BaseExtractor
+from extractors.base import BaseExtractor, ExtractorError
 from utils.cookie_cache import CookieCache
 
 logger = logging.getLogger(__name__)
-
-
-class ExtractorError(Exception):
-    pass
 
 
 _DOOD_UA = (
@@ -29,8 +25,8 @@ class DoodStreamExtractor(BaseExtractor):
     DoodStream / PlayMogo extractor.
     """
 
-    def __init__(self, request_headers: dict = None, proxies: list = None):
-        super().__init__(request_headers or {}, proxies, extractor_name="doodstream")
+    def __init__(self, request_headers: dict = None, proxies: list = None, bypass_warp: bool = False):
+        super().__init__(request_headers or {}, proxies, extractor_name="doodstream", bypass_warp=bypass_warp)
         self.request_headers = request_headers or {}
         self.base_headers = self.request_headers.copy()
         self.base_headers["User-Agent"] = _DOOD_UA
@@ -43,6 +39,7 @@ class DoodStreamExtractor(BaseExtractor):
 
     @staticmethod
     def _normalize_proxy_url(proxy_url: str) -> str:
+        proxy_url = _cfg.resolve_proxy_alias(str(proxy_url).strip()) or str(proxy_url).strip()
         # Keep local-DNS SOCKS5 for WARP; remote DNS via wireproxy can stall.
         if proxy_url.startswith("socks5://"):
             return proxy_url
@@ -125,7 +122,7 @@ class DoodStreamExtractor(BaseExtractor):
         bypass_warp: bool = False,
     ) -> dict | None:
         normalized_proxy = self._normalize_proxy_url(proxy_url) if proxy_url else None
-        if normalized_proxy is None and not _cfg.is_direct_connection_allowed(bypass_warp):
+        if normalized_proxy is None and not self._force_direct and not _cfg.is_direct_connection_allowed(bypass_warp):
             raise ExtractorError(
                 "DoodStream: direct fallback disabled; no proxy route available"
             )

@@ -412,6 +412,70 @@ class ManifestRewriter:
             return manifest_content
 
     @staticmethod
+    def _order_shared_audio_variants(lines: list) -> list:
+        """Sort variants highest-bandwidth-first when an audio group is shared.
+
+        FFmpeg assigns a shared rendition (``#EXT-X-MEDIA`` with URI) to the
+        first program referencing it, while players such as mpv default to the
+        highest-bandwidth variant. In the usual ascending master the audio then
+        lives in program 0 while the video plays program N, and mpv hides the
+        audio tracks completely (RaiPlay multiaudio). Keeping the highest
+        variant first makes the shared audio belong to the program players pick
+        by default, with ABR left intact.
+        """
+        audio_groups = set()
+        variant_indexes = []
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("#EXT-X-MEDIA:") and 'URI="' in stripped:
+                if re.search(r"TYPE=AUDIO", stripped):
+                    group_match = re.search(r'GROUP-ID="([^"]+)"', stripped)
+                    if group_match:
+                        audio_groups.add(group_match.group(1))
+            elif stripped.startswith("#EXT-X-STREAM-INF:") and i + 1 < len(lines):
+                variant_indexes.append(i)
+        if len(variant_indexes) < 2 or not audio_groups:
+            return lines
+
+        variants = []
+        group_uses = {}
+        for i in variant_indexes:
+            inf = lines[i].strip()
+            group_match = re.search(r'AUDIO="([^"]+)"', inf)
+            group = group_match.group(1) if group_match else ""
+            if group in audio_groups:
+                group_uses[group] = group_uses.get(group, 0) + 1
+            bandwidth_match = re.search(r"BANDWIDTH=(\d+)", inf)
+            variants.append(
+                {
+                    "inf": lines[i],
+                    "url": lines[i + 1],
+                    "bandwidth": int(bandwidth_match.group(1)) if bandwidth_match else 0,
+                }
+            )
+        if not any(count > 1 for count in group_uses.values()):
+            return lines
+
+        order = sorted(range(len(variants)), key=lambda n: variants[n]["bandwidth"], reverse=True)
+        if order == list(range(len(variants))):
+            return lines
+
+        position = {index: n for n, index in enumerate(variant_indexes)}
+        ordered = [variants[n] for n in order]
+        reordered = []
+        for i, line in enumerate(lines):
+            if i in position:
+                item = ordered[position[i]]
+                reordered.append(item["inf"])
+                reordered.append(item["url"])
+            elif i - 1 in position:
+                continue  # URI line already emitted with its STREAM-INF
+            else:
+                reordered.append(line)
+        logger.debug("HLS: reordered %s variants for shared audio group", len(variants))
+        return reordered
+
+    @staticmethod
     async def rewrite_manifest_urls(
         manifest_content: str,
         base_url: str,
@@ -430,9 +494,10 @@ class ManifestRewriter:
         extractor_key: str = None,
         stream_key: str = None,
         max_res: bool = False,
+        dual_video_track: int = 0,
     ) -> str:
         """Riscrive gli URL nei manifest HLS per passare attraverso il proxy."""
-        lines = manifest_content.split("\n")
+        lines = ManifestRewriter._order_shared_audio_variants(manifest_content.split("\n"))
         rewritten_lines = []
 
         # no_bypass e mantenuto per compatibilita, ma il rewriter ora proxa sempre.
@@ -481,6 +546,8 @@ class ManifestRewriter:
                 ]
             )
 
+            if dual_video_track:
+                header_params += f"&dual_video_track={int(dual_video_track)}"
             if api_password:
                 header_params += f"&api_password={api_password}"
             
@@ -644,6 +711,8 @@ class ManifestRewriter:
             header_params += f"&extractor_key={urllib.parse.quote(extractor_key, safe='')}"
         if stream_key:
             header_params += f"&stream_key={urllib.parse.quote(stream_key, safe='')}"
+        if dual_video_track:
+            header_params += f"&dual_video_track={int(dual_video_track)}"
         if max_res:
             header_params += "&max_res=true"
 
@@ -784,19 +853,10 @@ class ManifestRewriter:
                     encoded_key_url = urllib.parse.quote(absolute_key_url, safe="")
                     
                     # Proxy KEY URL (come per #EXT-X-KEY)
-                    proxy_key_url = (
-                        f"{proxy_base}/key?key_url={encoded_key_url}"
-                        f"&h_Referer={urllib.parse.quote(base_url, safe='')}"
-                    )
+                    proxy_key_url = f"{proxy_base}/key?key_url={encoded_key_url}"
+                    if "&h_referer=" not in header_params.lower():
+                        proxy_key_url += f"&h_Referer={urllib.parse.quote(base_url, safe='')}"
                     proxy_key_url += header_params
-                    if api_password:
-                        proxy_key_url += f"&api_password={api_password}"
-                    if bypass_warp:
-                        proxy_key_url += "&warp=off"
-                    if bypass_proxies:
-                        proxy_key_url += "&proxy=off"
-                    if disable_ssl:
-                        proxy_key_url += "&disable_ssl=1"
 
                     new_line = line[:uri_start] + proxy_key_url + line[uri_end:]
                     rewritten_lines.append(new_line)
@@ -837,12 +897,19 @@ class ManifestRewriter:
                     base_query,
                 )
 
-                encoded_url = urllib.parse.quote(absolute_url, safe="")
-
                 # Variant URIs after #EXT-X-STREAM-INF are playlists even when
                 # providers like VixSrc expose them as extensionless /playlist URLs.
                 is_manifest_uri = next_uri_is_manifest or ".m3u8" in absolute_url
                 next_uri_is_manifest = False
+
+                if not is_manifest_uri and (extractor_key == "fctv33" or ("_ctump=" in absolute_url and "_ctuph=" in absolute_url)):
+                    try:
+                        from extractors.fctv33 import resolve_fctv33_segment_url
+                        absolute_url = resolve_fctv33_segment_url(absolute_url)
+                    except Exception as _fctv_err:
+                        logger.debug("Failed to resolve FCTV33 segment in manifest: %s", _fctv_err)
+
+                encoded_url = urllib.parse.quote(absolute_url, safe="")
 
                 # Se e manifest usa /proxy/hls/manifest.m3u8, altrimenti determina estensione
                 if is_manifest_uri:
@@ -855,7 +922,7 @@ class ManifestRewriter:
                         )
                 else:
                     # Mantieni un endpoint coerente con il tipo reale del segmento
-                    path = urllib.parse.urlparse(absolute_url).path
+                    path = urllib.parse.urlparse(absolute_url).path.lower()
                     ext = ".ts"
                     if path.endswith(".vtt") or path.endswith(".webvtt"):
                         ext = ".vtt"
@@ -865,6 +932,11 @@ class ManifestRewriter:
                         or path.endswith(".m4v")
                     ):
                         ext = ".mp4"
+                    elif path.endswith((".aac", ".mp3", ".m4a", ".ac3", ".ec3")):
+                        # Keep the real audio extension: ffmpeg's extension_picky
+                        # rejects a .ts URL carrying raw AAC/MP3/AC-3 and aborts
+                        # the whole HLS input (no audio, endless buffering).
+                        ext = path[path.rfind("."):]
 
                     proxy_url = (
                         f"{proxy_base}/proxy/hls/segment{ext}?d={encoded_url}{header_params}"
